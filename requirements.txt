@@ -1,0 +1,9 @@
+fastapi
+azure-functions
+scikit-surprise
+pandas
+uvicorn
+pydantic
+httpx
+jinja2
+python-multipart

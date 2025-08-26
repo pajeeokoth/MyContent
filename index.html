@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Article Recommendations</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    
+</head>
+<body>
+    <h1>Get Recommended Articles</h1>
+    <form id="recommendationForm">
+        <label for="user_id">Enter User ID:</label>
+        <input type="text" id="user_id" name="user_id" required>
+        <button type="submit">Get Recommendations</button>
+    </form>
+
+    <div class="recommendations">
+        <h2>Recommended Articles:</h2>
+        <ul id="articleList"></ul>
+    </div>
+    
+    <div id="spinner" style="display: none;">
+    <p>Processing...</p>
+    <img src="/static/spinner.gif" alt="Loading" width="150">
+    </div>
+
+    <script>
+        document.getElementById('recommendationForm').addEventListener('submit', async function(event) {
+            event.preventDefault(); // Prevent form from refreshing the page
+
+            const userId = document.getElementById('user_id').value;
+            const articleList = document.getElementById('articleList');
+            articleList.innerHTML = ''; // Clear previous results
+
+            try {
+                const response = await fetch('http://127.0.0.1:8000/recommendations', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ user_id: userId }),
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to fetch recommendations');
+                }
+
+                const data = await response.json();
+                console.log(data);
+                data.articles.forEach(article => {
+                    const listItem = document.createElement('li');
+                    listItem.textContent = article;
+                    articleList.appendChild(listItem);
+                });
+            } catch (error) {
+                const errorItem = document.createElement('li');
+                errorItem.textContent = `Error: ${error.message}`;
+                articleList.appendChild(errorItem);
+            }
+        });
+    </script>
+</body>
+</html>
