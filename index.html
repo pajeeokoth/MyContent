@@ -34,12 +34,12 @@
             articleList.innerHTML = ''; // Clear previous results
 
             try {
-                const response = await fetch('http://127.0.0.1:8000/recommendations', {
+                const response = await fetch('/recommendations', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ user_id: userId }),
+                    body: JSON.stringify({ user_id: Number(userId) }),
                 });
 
                 if (!response.ok) {
@@ -47,7 +47,9 @@
                 }
 
                 const data = await response.json();
-                console.log(data);
+                // console.log(data);
+                // server returns a simple array of ints — handle that
+                const articles = Array.isArray(data) ? data : (data.articles || []);
                 data.articles.forEach(article => {
                     const listItem = document.createElement('li');
                     listItem.textContent = article;
