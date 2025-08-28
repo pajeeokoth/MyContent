@@ -101,9 +101,12 @@ class RecommendRequest(BaseModel):
     user_id: int
     n: int = 5
 
+class RecommendResponse(BaseModel):
+    articles: List[int]
+
 # Register both paths so clients with/without trailing slash won't get 404 for POST
-@app.post("/recommendations", response_model=List[int])
-@app.post("/recommendations/", response_model=List[int])
+@app.post("/recommendations", response_model=RecommendResponse)
+@app.post("/recommendations/", response_model=RecommendResponse)
 async def recommend_post(body: RecommendRequest):
     user_id = int(body.user_id)
     n = int(body.n)
@@ -115,13 +118,13 @@ async def recommend_post(body: RecommendRequest):
     recommended = get_top_n_recommendations(train, model, user_id, n)
     if not recommended:
         raise HTTPException(status_code=404, detail="No recommendations available")
-    return recommended
+    return  {"articles": recommended}
 
 # -----------------------
 # API endpoint
 # -----------------------
 
-@app.get("/recommend/{user_id}", response_model=List[int])
+@app.get("/recommend/{user_id}", response_model=RecommendResponse)
 async def recommend_articles(user_id: int):
     # Check user exists in training set
     if not any(train['user_id'].astype(int) == int(user_id)):

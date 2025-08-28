@@ -43,14 +43,15 @@
                 });
 
                 if (!response.ok) {
-                    throw new Error('Failed to fetch recommendations');
+                    const err = await response.json().catch(()=>null);
+                    throw new Error(err?.detail || 'Failed to fetch recommendations');
                 }
 
                 const data = await response.json();
                 // console.log(data);
                 // server returns a simple array of ints — handle that
                 const articles = Array.isArray(data) ? data : (data.articles || []);
-                data.articles.forEach(article => {
+                articles.forEach(article => {
                     const listItem = document.createElement('li');
                     listItem.textContent = article;
                     articleList.appendChild(listItem);
