@@ -71,26 +71,55 @@ async def root():
 # -----------------------
 
 def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5) -> List[int]:
-     # Ensure consistent types
-     all_article_ids = df['click_article_id'].unique()
-     user_article_ids = df[df['user_id'] == user_id]['click_article_id'].unique()
-     predictions = []
- 
-     for article_id in all_article_ids:
-         if article_id not in user_article_ids:
-             # Surprise model.predict expects raw ids (often strings) — cast to str for safety
-             try:
-                 pred = model.predict(str(user_id), str(article_id))
-                 score = float(pred.est)
-             except Exception:
-                 # fallback: try without casting
-                 pred = model.predict(user_id, article_id)
-                 score = float(pred.est)
-             predictions.append((article_id, score))
- 
-     predictions.sort(key=lambda x: x[1], reverse=True)
-     top_ids = [int(p[0]) if (isinstance(p[0], (int, float)) or str(p[0]).isdigit()) else p[0] for p in predictions[:n]]
-     return top_ids
+    # Use raw ids exactly as used when training the Surprise model (often strings)
+    raw_user = str(user_id)
+
+    # Check if user exists in Surprise trainset — avoids global-mean predictions for unknown users
+    try:
+        known_users = getattr(model.trainset, '_raw2inner_id_users', None)
+        user_known = (known_users is not None) and (raw_user in known_users)
+    except Exception:
+        user_known = False
+
+    print("user known in model:", str(38) in model.trainset._raw2inner_id_users) # diagnostics
+
+    if not user_known:
+        # Cold-start fallback: return top-n most popular articles from df
+        popular = df['click_article_id'].value_counts().index.tolist()
+        return [int(a) if str(a).isdigit() else a for a in popular[:n]]
+
+    all_article_ids = df['click_article_id'].unique()
+    user_article_ids = set(df[df['user_id'].astype(str) == raw_user]['click_article_id'].astype(str).unique())
+
+    predictions = []
+    for article_id in all_article_ids:
+        raw_item = str(article_id)
+        if raw_item in user_article_ids:
+            continue
+        # predict using raw ids (strings)
+        try:
+            pred = model.predict(raw_user, raw_item)
+            score = float(pred.est)
+        except Exception:
+            # fallback: try other types
+            try:
+                pred = model.predict(int(raw_user), int(raw_item))
+                score = float(pred.est)
+            except Exception:
+                continue
+        predictions.append((article_id, score))
+    
+    print(model.predict(str(38), str(12345))) # Example prediction for diagnostics
+
+    # Diagnostics: if all scores equal, return popular fallback
+    scores = [p[1] for p in predictions]
+    if len(scores) and (max(scores) - min(scores) < 1e-6):
+        popular = df['click_article_id'].value_counts().index.tolist()
+        return [int(a) if str(a).isdigit() else a for a in popular[:n]]
+
+    predictions.sort(key=lambda x: x[1], reverse=True)
+    top_ids = [int(p[0]) if (isinstance(p[0], (int, float)) or str(p[0]).isdigit()) else p[0] for p in predictions[:n]]
+    return top_ids
 
 # -----------------------
 # Post Recommendation endpoint
