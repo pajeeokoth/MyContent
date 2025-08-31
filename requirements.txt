@@ -8,12 +8,8 @@ httpx
 jinja2
 python-multipart
 ###########
-fastapi
-uvicorn
+# For Heroku
 gunicorn
-pandas
 numpy
 scikit-learn
-scikit-surprise
-jinja2
-python-multipart
+pickle-mixin
