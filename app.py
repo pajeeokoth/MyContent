@@ -7,6 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware # to allow cross-origin reque
 from typing import List
 from surprise import Dataset, Reader, SVD, accuracy
 from surprise.model_selection import train_test_split, cross_validate
+import logging
+from fastapi.responses import JSONResponse
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # -----------------------
 # Load and combine CSVs
@@ -24,14 +29,15 @@ df = pd.concat(
 # -----------------------
 # Split the data into training and test sets
 # -----------------------
-from sklearn.model_selection import train_test_split
-train, test = train_test_split(df, test_size=0.2, random_state=42)
-print(f"Training set size: {train.shape}\nTest set size: {test.shape}")
+reader = Reader(rating_scale=(1, 130))
+data = Dataset.load_from_df(df[['user_id', 'click_article_id', 'session_size']], reader)
+trainset, testset = train_test_split(data, test_size=0.25, random_state=42)
+# print(f"Training set size: {train.shape}\nTest set size: {test.shape}")
 
 # ------------------------
 # Load the trained model
 # ------------------------
-model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "svd_model.pkl"))
+model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "svd_algo_retrained.pkl"))
 if not os.path.exists(model_path):
     raise FileNotFoundError(f"Model file not found: {model_path}")
 with open(model_path, 'rb') as file:
@@ -74,6 +80,7 @@ def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5)
     # Use raw ids exactly as used when training the Surprise model (often strings)
     raw_user = str(user_id)
 
+
     # Check if user exists in Surprise trainset — avoids global-mean predictions for unknown users
     try:
         known_users = getattr(model.trainset, '_raw2inner_id_users', None)
@@ -81,7 +88,16 @@ def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5)
     except Exception:
         user_known = False
 
-    print("user known in model:", str(5559) in model.trainset._raw2inner_id_users) # diagnostics
+    # print("user known in model:", str(raw_user) in model.trainset._raw2inner_id_users) # diagnostics
+    # print("raw user:", raw_user) # diagnostics
+
+    # check model has trainset attribute
+    if not hasattr(model, 'trainset'):
+        raise ValueError("Model is not trained or does not have a 'trainset' attribute")
+    # print("has trainset:", hasattr(model, "trainset")) # diagnostics
+    # print("number of users:", len(model.trainset._raw2inner_id_users)) # diagnostics
+    # print("number of items:", len(model.trainset._raw2inner_id_items)) # diagnostics
+
 
     if not user_known:
         # Cold-start fallback: return top-n most popular articles from df
@@ -90,6 +106,7 @@ def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5)
 
     all_article_ids = df['click_article_id'].unique()
     user_article_ids = set(df[df['user_id'].astype(str) == raw_user]['click_article_id'].astype(str).unique())
+
 
     predictions = []
     for article_id in all_article_ids:
@@ -109,7 +126,7 @@ def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5)
                 continue
         predictions.append((article_id, score))
     
-    print(model.predict(str(38), str(12345))) # Example prediction for diagnostics
+    print(model.predict(str(raw_user), str(raw_user))) # Example prediction for diagnostics
 
     # Diagnostics: if all scores equal, return popular fallback
     scores = [p[1] for p in predictions]
@@ -141,10 +158,10 @@ async def recommend_post(body: RecommendRequest):
     n = int(body.n)
 
     # validate user exists
-    if not any(train['user_id'].astype(int) == user_id):
+    if not any(df['user_id'].astype(int) == user_id):   # check in full df and replaced train with df
         raise HTTPException(status_code=404, detail="User not found")
 
-    recommended = get_top_n_recommendations(train, model, user_id, n)
+    recommended = get_top_n_recommendations(df, model, user_id, n) #replaced train with df
     if not recommended:
         raise HTTPException(status_code=404, detail="No recommendations available")
     return  {"articles": recommended}
@@ -156,13 +173,83 @@ async def recommend_post(body: RecommendRequest):
 @app.get("/recommend/{user_id}", response_model=RecommendResponse)
 async def recommend_articles(user_id: int):
     # Check user exists in training set
-    if not any(train['user_id'].astype(int) == int(user_id)):
+    if not any(df['user_id'].astype(int) == int(user_id)): #replaced train with df can also replace with trainset
         raise HTTPException(status_code=404, detail="User not found")
 
-    recommended = get_top_n_recommendations(train, model, user_id)
+    recommended = get_top_n_recommendations(df, model, user_id) #replaced train with df
     if not recommended:
         raise HTTPException(status_code=404, detail="No recommendations available")
-    return recommended
+    return {"articles": recommended}
+
+# -----------------------
+# Debug endpoint
+# -----------------------
+
+@app.get("/_debug", response_class=JSONResponse)
+async def debug_info(sample_user_count: int = 3, sample_item_count: int = 10):
+    trainset = getattr(model, "trainset", None)
+    if trainset is None:
+        return {"error": "model has no trainset (maybe not a Surprise model or not trained)"}
+
+    raw2inner_u = getattr(trainset, "_raw2inner_id_users", {})
+    raw2inner_i = getattr(trainset, "_raw2inner_id_items", {})
+
+    n_users = len(raw2inner_u)
+    n_items = len(raw2inner_i)
+
+    # dataset-level stats from the raw df used to build the dataset
+    # assume 'session_size' was used as the rating in the original training
+    rating_series = df['session_size'].astype(float)
+    rating_stats = {
+        "min": float(rating_series.min()),
+        "max": float(rating_series.max()),
+        "mean": float(rating_series.mean()),
+        "std": float(rating_series.std()),
+        "var": float(rating_series.var()),
+        "n_unique": int(rating_series.nunique())
+    }
+
+    # Surprise trainset global mean (if available)
+    global_mean = getattr(trainset, "global_mean", None)
+
+    # pick sample users/items
+    sample_users = list(raw2inner_u.keys())[:sample_user_count]
+    sample_items = list(raw2inner_i.keys())[:sample_item_count]
+
+    # Build small matrix of predictions and collect per-user score variance
+    preds = {}
+    per_user_ranges = {}
+    for u in sample_users:
+        preds[u] = []
+        seen = set(df[df['user_id'].astype(str) == str(u)]['click_article_id'].astype(str).unique())
+        scores = []
+        for it in sample_items:
+            if str(it) in seen:
+                preds[u].append({"item": it, "seen": True})
+                continue
+            try:
+                p = model.predict(str(u), str(it))
+                score = float(p.est)
+                preds[u].append({"item": it, "score": score})
+                scores.append(score)
+            except Exception as e:
+                preds[u].append({"item": it, "error": str(e)})
+        per_user_ranges[u] = {"min": min(scores) if scores else None, "max": max(scores) if scores else None,
+                              "range": (max(scores)-min(scores)) if scores else None}
+
+    info = {
+        "n_users_in_trainset": n_users,
+        "n_items_in_trainset": n_items,
+        "trainset_global_mean": float(global_mean) if global_mean is not None else None,
+        "raw_rating_stats": rating_stats,
+        "sample_users": sample_users,
+        "sample_items": sample_items,
+        "sample_predictions": preds,
+        "per_user_score_ranges": per_user_ranges
+    }
+
+    logger.info("Debug info requested: users=%d items=%d", n_users, n_items)
+    return info
 
 if __name__ == "__main__":
     import uvicorn
