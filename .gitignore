@@ -181,3 +181,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 svd_model.pkl
+svd_algo.pkl
+svd_algo_retrained.pkl
+retrain_model.py

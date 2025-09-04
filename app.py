@@ -35,13 +35,91 @@ trainset, testset = train_test_split(data, test_size=0.25, random_state=42)
 # print(f"Training set size: {train.shape}\nTest set size: {test.shape}")
 
 # ------------------------
-# Load the trained model
+# Load the trained model (auto-find / download fallback)
 # ------------------------
-model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "svd_algo_retrained.pkl"))
-if not os.path.exists(model_path):
-    raise FileNotFoundError(f"Model file not found: {model_path}")
-with open(model_path, 'rb') as file:
-    model = pickle.load(file)
+def _download_from_s3(bucket, key, dest_path):
+    try:
+        import boto3
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        )
+        s3.download_file(bucket, key, dest_path)
+        logger.info("Downloaded model from S3: s3://%s/%s -> %s", bucket, key, dest_path)
+        return True
+    except Exception as e:
+        logger.warning("S3 download failed: %s", e)
+        return False
+
+def _download_from_url(url, dest_path):
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(url, dest_path)
+        logger.info("Downloaded model from URL: %s -> %s", url, dest_path)
+        return True
+    except Exception as e:
+        logger.warning("URL download failed: %s", e)
+        return False
+
+def load_model_auto():
+    # candidate local filenames (in order)
+    candidates = [
+        "svd_algo_retrained.pkl",
+        "svd_algo.pkl",
+        "svd_model.pkl",
+        "svd_algo_retrained.pkl"  # keep common names
+    ]
+    base_dir = os.path.dirname(__file__)
+    for name in candidates:
+        path = os.path.abspath(os.path.join(base_dir, name))
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    m = pickle.load(f)
+                logger.info("Loaded model from local file: %s", path)
+                return m
+            except Exception as e:
+                logger.warning("Failed to load model file %s: %s", path, e)
+
+    # try S3 if configured
+    s3_bucket = os.getenv("MODEL_S3_BUCKET")
+    s3_key = os.getenv("MODEL_S3_KEY")
+    if s3_bucket and s3_key:
+        local_name = os.path.basename(s3_key)
+        local_path = os.path.abspath(os.path.join(base_dir, local_name))
+        if _download_from_s3(s3_bucket, s3_key, local_path):
+            try:
+                with open(local_path, "rb") as f:
+                    m = pickle.load(f)
+                logger.info("Loaded model from downloaded S3 file: %s", local_path)
+                return m
+            except Exception as e:
+                logger.warning("Failed to load downloaded S3 model %s: %s", local_path, e)
+
+    # try HTTP URL if provided
+    model_url = os.getenv("MODEL_URL")
+    if model_url:
+        local_name = os.path.basename(model_url.split("?")[0]) or "svd_model_downloaded.pkl"
+        local_path = os.path.abspath(os.path.join(base_dir, local_name))
+        if _download_from_url(model_url, local_path):
+            try:
+                with open(local_path, "rb") as f:
+                    m = pickle.load(f)
+                logger.info("Loaded model from downloaded URL file: %s", local_path)
+                return m
+            except Exception as e:
+                logger.warning("Failed to load downloaded URL model %s: %s", local_path, e)
+
+    # nothing worked
+    tried = ", ".join([os.path.join(base_dir, n) for n in candidates])
+    raise FileNotFoundError(
+        "No model found. Tried local files: {}. "
+        "Set MODEL_S3_BUCKET & MODEL_S3_KEY to download from S3, or MODEL_URL to download from an HTTP URL.".format(tried)
+    )
+
+# load model (raises descriptive error if not available)
+model = load_model_auto()
 
 # -----------------------
 # FastAPI app
