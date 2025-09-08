@@ -27,40 +27,8 @@ df = pd.concat(
 )
 
 # -----------------------
-# Split the data into training and test sets
+# Load model (from local)
 # -----------------------
-reader = Reader(rating_scale=(1, 130))
-data = Dataset.load_from_df(df[['user_id', 'click_article_id', 'session_size']], reader)
-trainset, testset = train_test_split(data, test_size=0.25, random_state=42)
-# print(f"Training set size: {train.shape}\nTest set size: {test.shape}")
-
-# ------------------------
-# Load the trained model (auto-find / download fallback)
-# ------------------------
-def _download_from_s3(bucket, key, dest_path):
-    try:
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-        s3.download_file(bucket, key, dest_path)
-        logger.info("Downloaded model from S3: s3://%s/%s -> %s", bucket, key, dest_path)
-        return True
-    except Exception as e:
-        logger.warning("S3 download failed: %s", e)
-        return False
-
-def _download_from_url(url, dest_path):
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(url, dest_path)
-        logger.info("Downloaded model from URL: %s -> %s", url, dest_path)
-        return True
-    except Exception as e:
-        logger.warning("URL download failed: %s", e)
-        return False
 
 def load_model_auto():
     # candidate local filenames (in order)
@@ -81,41 +49,12 @@ def load_model_auto():
                 return m
             except Exception as e:
                 logger.warning("Failed to load model file %s: %s", path, e)
-
-    # try S3 if configured
-    s3_bucket = os.getenv("MODEL_S3_BUCKET")
-    s3_key = os.getenv("MODEL_S3_KEY")
-    if s3_bucket and s3_key:
-        local_name = os.path.basename(s3_key)
-        local_path = os.path.abspath(os.path.join(base_dir, local_name))
-        if _download_from_s3(s3_bucket, s3_key, local_path):
-            try:
-                with open(local_path, "rb") as f:
-                    m = pickle.load(f)
-                logger.info("Loaded model from downloaded S3 file: %s", local_path)
-                return m
-            except Exception as e:
-                logger.warning("Failed to load downloaded S3 model %s: %s", local_path, e)
-
-    # try HTTP URL if provided
-    model_url = os.getenv("MODEL_URL")
-    if model_url:
-        local_name = os.path.basename(model_url.split("?")[0]) or "svd_model_downloaded.pkl"
-        local_path = os.path.abspath(os.path.join(base_dir, local_name))
-        if _download_from_url(model_url, local_path):
-            try:
-                with open(local_path, "rb") as f:
-                    m = pickle.load(f)
-                logger.info("Loaded model from downloaded URL file: %s", local_path)
-                return m
-            except Exception as e:
-                logger.warning("Failed to load downloaded URL model %s: %s", local_path, e)
-
+    # if we reach here,
     # nothing worked
     tried = ", ".join([os.path.join(base_dir, n) for n in candidates])
     raise FileNotFoundError(
         "No model found. Tried local files: {}. "
-        "Set MODEL_S3_BUCKET & MODEL_S3_KEY to download from S3, or MODEL_URL to download from an HTTP URL.".format(tried)
+        "And everything else.".format(tried)
     )
 
 # load model (raises descriptive error if not available)
@@ -153,72 +92,68 @@ async def root():
 # -----------------------
 # Recommendation function
 # -----------------------
-
-def get_top_n_recommendations(df: pd.DataFrame, model, user_id: int, n: int = 5) -> List[int]:
-    # Use raw ids exactly as used when training the Surprise model (often strings)
+# Function to get top N recommendations for a user
+def get_top_n_recommendations(df, model, user_id, n=5):
+    """
+    Predict top-n articles for user_id using model.
+    Uses Surprise trainset raw id mappings and consistent string casting.
+    """
     raw_user = str(user_id)
+    trainset = getattr(model, "trainset", None)
 
+    # Popularity fallback helper
+    def popular_top(k):
+        popular = df['click_article_id'].astype(str).value_counts().index.tolist()
+        return [int(x) if str(x).isdigit() else x for x in popular[:k]]
 
-    # Check if user exists in Surprise trainset — avoids global-mean predictions for unknown users
-    try:
-        known_users = getattr(model.trainset, '_raw2inner_id_users', None)
-        user_known = (known_users is not None) and (raw_user in known_users)
-    except Exception:
-        user_known = False
+    if trainset is None:
+        logger.warning("Model has no trainset; returning popular items")
+        return popular_top(n)
 
-    # print("user known in model:", str(raw_user) in model.trainset._raw2inner_id_users) # diagnostics
-    # print("raw user:", raw_user) # diagnostics
+    raw2inner_u = getattr(trainset, "_raw2inner_id_users", {})
+    raw2inner_i = getattr(trainset, "_raw2inner_id_items", {})
 
-    # check model has trainset attribute
-    if not hasattr(model, 'trainset'):
-        raise ValueError("Model is not trained or does not have a 'trainset' attribute")
-    # print("has trainset:", hasattr(model, "trainset")) # diagnostics
-    # print("number of users:", len(model.trainset._raw2inner_id_users)) # diagnostics
-    # print("number of items:", len(model.trainset._raw2inner_id_items)) # diagnostics
+    # Cold-start: unknown user -> popularity
+    if raw_user not in raw2inner_u:
+        logger.info("User %s unknown to model -> popularity fallback", raw_user)
+        return popular_top(n)
 
-
-    if not user_known:
-        # Cold-start fallback: return top-n most popular articles from df
-        popular = df['click_article_id'].value_counts().index.tolist()
-        return [int(a) if str(a).isdigit() else a for a in popular[:n]]
-
-    all_article_ids = df['click_article_id'].unique()
-    user_article_ids = set(df[df['user_id'].astype(str) == raw_user]['click_article_id'].astype(str).unique())
-
+    # Candidate items: only items known to the trained model
+    candidate_items = list(raw2inner_i.keys())
+    # Items user already saw (string-cast)
+    user_seen = set(df[df['user_id'].astype(str) == raw_user]['click_article_id'].astype(str).unique())
 
     predictions = []
-    for article_id in all_article_ids:
-        raw_item = str(article_id)
-        if raw_item in user_article_ids:
+    for raw_item in candidate_items:
+        if raw_item in user_seen:
             continue
-        # predict using raw ids (strings)
         try:
-            pred = model.predict(raw_user, raw_item)
-            score = float(pred.est)
-        except Exception:
-            # fallback: try other types
-            try:
-                pred = model.predict(int(raw_user), int(raw_item))
-                score = float(pred.est)
-            except Exception:
-                continue
-        predictions.append((article_id, score))
-    
-    print(model.predict(str(raw_user), str(raw_user))) # Example prediction for diagnostics
+            p = model.predict(raw_user, raw_item)
+            score = float(p.est)
+            predictions.append((raw_item, score))
+        except Exception as e:
+            # skip items that fail for any reason
+            logger.debug("predict failed for user=%s item=%s: %s", raw_user, raw_item, e)
+            continue
 
-    # Diagnostics: if all scores equal, return popular fallback
-    scores = [p[1] for p in predictions]
-    if len(scores) and (max(scores) - min(scores) < 1e-6):
-        popular = df['click_article_id'].value_counts().index.tolist()
-        return [int(a) if str(a).isdigit() else a for a in popular[:n]]
+    if not predictions:
+        logger.info("No predictions (all candidate items skipped) -> popularity fallback")
+        return popular_top(n)
 
+    scores = [s for _, s in predictions]
+    # If model returns near-constant scores (global mean) -> popularity fallback
+    if max(scores) - min(scores) < 1e-6:
+        logger.info("Predictions show no variance (global mean). Using popularity fallback")
+        return popular_top(n)
+
+    # sort and return top-n (convert back to int when appropriate)
     predictions.sort(key=lambda x: x[1], reverse=True)
-    top_ids = [int(p[0]) if (isinstance(p[0], (int, float)) or str(p[0]).isdigit()) else p[0] for p in predictions[:n]]
-    return top_ids
+    top_raw = [p[0] for p in predictions[:n]]
+    return [int(x) if str(x).isdigit() else x for x in top_raw]
 
 # -----------------------
-# Post Recommendation endpoint
-# -----------------------
+# # Post Recommendation endpoint
+# # -----------------------
 from pydantic import BaseModel
 
 class RecommendRequest(BaseModel):
