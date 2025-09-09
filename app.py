@@ -36,7 +36,7 @@ def load_model_auto():
         "svd_algo_retrained.pkl",
         "svd_algo.pkl",
         "svd_model.pkl",
-        "svd_algo_retrained.pkl"  # keep common names
+        "svd_algo_retrained.pkl"
     ]
     base_dir = os.path.dirname(__file__)
     for name in candidates:
@@ -46,11 +46,12 @@ def load_model_auto():
                 with open(path, "rb") as f:
                     m = pickle.load(f)
                 logger.info("Loaded model from local file: %s", path)
+                # publish loaded path for diagnostics
+                globals()["MODEL_FILE_LOADED"] = path
                 return m
             except Exception as e:
                 logger.warning("Failed to load model file %s: %s", path, e)
-    # if we reach here,
-    # nothing worked
+
     tried = ", ".join([os.path.join(base_dir, n) for n in candidates])
     raise FileNotFoundError(
         "No model found. Tried local files: {}. "
@@ -59,6 +60,19 @@ def load_model_auto():
 
 # load model (raises descriptive error if not available)
 model = load_model_auto()
+
+# Log quick model/trainset info on startup
+try:
+    logger.info("Model type: %s", type(model))
+    trainset = getattr(model, "trainset", None)
+    if trainset is None:
+        logger.warning("Loaded model has no trainset attribute.")
+    else:
+        logger.info("Trainset: n_users=%d n_items=%d", trainset.n_users, trainset.n_items)
+        logger.info("Trainset global_mean=%s", getattr(trainset, "global_mean", None))
+    logger.info("Model file loaded: %s", globals().get("MODEL_FILE_LOADED"))
+except Exception as _e:
+    logger.exception("Error while logging model info: %s", _e)
 
 # -----------------------
 # FastAPI app
@@ -262,6 +276,105 @@ async def debug_info(sample_user_count: int = 3, sample_item_count: int = 10):
     }
 
     logger.info("Debug info requested: users=%d items=%d", n_users, n_items)
+    return info
+
+# -----------------------
+# Extended Debug endpoint
+# -----------------------
+
+@app.get("/_debug_full", response_class=JSONResponse)
+async def debug_full(user_id: str = None, item_id: str = None, sample_users: int = 5, sample_items: int = 20):
+    """
+    Extended diagnostics:
+    - Reports which model file was loaded
+    - Trainset stats and global_mean
+    - Rating distribution in current df (min/max/mean/std/unique)
+    - Sample predictions for given user/item or for sampled users/items
+    Use query params: ?user_id=123&item_id=456
+    """
+    info = {}
+    info["model_file_loaded"] = globals().get("MODEL_FILE_LOADED")
+    info["model_type"] = str(type(model))
+
+    trainset = getattr(model, "trainset", None)
+    if trainset is None:
+        info["trainset"] = None
+    else:
+        raw2inner_u = getattr(trainset, "_raw2inner_id_users", {})
+        raw2inner_i = getattr(trainset, "_raw2inner_id_items", {})
+        info["trainset"] = {
+            "n_users": len(raw2inner_u),
+            "n_items": len(raw2inner_i),
+            "global_mean": float(getattr(trainset, "global_mean", float("nan")))
+        }
+
+    # dataset rating stats if session_size exists
+    if "session_size" in df.columns:
+        rs = df["session_size"].astype(float)
+        info["rating_stats"] = {"min": float(rs.min()), "max": float(rs.max()), "mean": float(rs.mean()), "std": float(rs.std()), "n_unique": int(rs.nunique())}
+    else:
+        info["rating_stats"] = None
+
+    # check that sample ids are in trainset mappings
+    raw2inner_u = getattr(trainset, "_raw2inner_id_users", {}) if trainset else {}
+    raw2inner_i = getattr(trainset, "_raw2inner_id_items", {}) if trainset else {}
+
+    # Helpers to sample
+    sample_users_list = list(raw2inner_u.keys())[:sample_users] if raw2inner_u else []
+    sample_items_list = list(raw2inner_i.keys())[:sample_items] if raw2inner_i else []
+
+    info["sample_users_in_trainset"] = sample_users_list
+    info["sample_items_in_trainset"] = sample_items_list
+
+    # If explicit user_id/item_id requested, include them
+    if user_id is not None:
+        u = str(user_id)
+        info["requested_user_in_trainset"] = u in raw2inner_u
+    if item_id is not None:
+        it = str(item_id)
+        info["requested_item_in_trainset"] = it in raw2inner_i
+
+    # Make a batch of predictions and compute variance
+    def predict_safe(u, it):
+        try:
+            p = model.predict(str(u), str(it))
+            return float(p.est)
+        except Exception as e:
+            return {"error": str(e)}
+
+    preds = {}
+    # if user_id specified, predict across sample items (or provided item_id)
+    if user_id is not None:
+        u = str(user_id)
+        items = [str(item_id)] if item_id is not None else sample_items_list
+        preds[u] = []
+        for it in items:
+            preds[u].append({"item": it, "pred": predict_safe(u, it)})
+    else:
+        # produce matrix for sample users x sample items
+        for u in sample_users_list:
+            preds[u] = []
+            for it in sample_items_list:
+                val = predict_safe(u, it)
+                preds[u].append({"item": it, "pred": val})
+
+    # compute basic stats: check if all numeric preds are identical
+    flat_scores = []
+    for u, lst in preds.items():
+        for e in lst:
+            v = e["pred"]
+            if isinstance(v, float):
+                flat_scores.append(v)
+
+    info["sample_predictions"] = preds
+    if flat_scores:
+        info["pred_stats"] = {"min": min(flat_scores), "max": max(flat_scores), "range": max(flat_scores)-min(flat_scores)}
+    else:
+        info["pred_stats"] = None
+
+    # quick sanity: show first candidate item used by app recommender
+    info["first_candidate_item"] = sample_items_list[0] if sample_items_list else None
+
     return info
 
 if __name__ == "__main__":
