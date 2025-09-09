@@ -85,6 +85,7 @@ ipython_config.py
 # folders to ignore
 logs/
 static/
+azure_app/
 .pkl
 .gif
 .png
